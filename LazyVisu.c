@@ -5,6 +5,7 @@
 #include <fcntl.h>
 #include <netdb.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/mman.h>
 
@@ -12,8 +13,13 @@
 #include <clutter/clutter.h>
 #include <clutter-gtk/clutter-gtk.h>
 
-#define HAVE_UI_DEBUG
-#define HAVE_SERVER_DEBUG
+/**/
+#define __LONG_TYPE_64
+#include "lazy_passthrough_internal.h"
+
+/**/
+/* #define HAVE_UI_DEBUG */
+/* #define HAVE_SERVER_DEBUG */
 
 #ifdef HAVE_UI_DEBUG
 # define UI_DEBUG(args...) do {                 \
@@ -51,15 +57,248 @@
 
 #define DEFAULT_BUFFER_PATH "/tmp/rootfs/tmp"
 
+/**/
+gchar *path_to_buffers = DEFAULT_BUFFER_PATH;
+
+/**/
 typedef struct
 {
-        gint   id;
         gchar *filename;
-        int    fd;
+        gpointer ptr;
+        gint fd;
 
-        void  *ptr;
-        gint   width, height;
-        gsize  size;
+        guint id;
+        gint  width;
+        gint  height;
+        gint  bpp;
+} emu_buffer_t;
+
+guint emu_buffer_get_size (emu_buffer_t *buffer);
+
+void
+emu_buffer_free (emu_buffer_t *buffer)
+{
+        g_return_if_fail (buffer != NULL);
+
+        if (buffer->ptr != NULL && buffer->ptr != MAP_FAILED)
+                munmap (buffer->ptr, emu_buffer_get_size (buffer));
+
+        if (buffer->fd >= 0)
+                close (buffer->fd);
+
+        if (buffer->filename)
+                g_free (buffer->filename);
+
+        g_free (buffer);
+}
+
+emu_buffer_t *
+emu_buffer_new (guint id, gint width, gint height, gint bpp)
+{
+        emu_buffer_t *buffer;
+
+        g_return_val_if_fail (width >= 0 && height >= 0 && bpp >= 0, NULL);
+
+        buffer = g_new0 (emu_buffer_t, 1);
+
+        g_return_val_if_fail (buffer != NULL, NULL);
+
+        buffer->filename = g_strdup_printf ("%s/%x", path_to_buffers, id);
+        buffer->id = id;
+        buffer->width = width;
+        buffer->height = height;
+        buffer->bpp = bpp;
+
+        buffer->fd = open (buffer->filename, O_CREAT | O_RDWR,
+                           S_IRUSR | S_IWUSR | S_IRGRP |
+                           S_IWGRP | S_IROTH | S_IWOTH);
+        if (buffer->fd < 0)
+        {
+                SERVER_ERROR ("Cannot open %s : %s",
+                              buffer->filename, strerror (errno));
+                goto error;
+        }
+
+        if (lseek (buffer->fd,
+                   buffer->width * buffer->height * buffer->bpp,
+                   SEEK_SET) == -1)
+        {
+                SERVER_ERROR ("Cannot lseek in %s : %s",
+                              buffer->filename, strerror (errno));
+                goto error;
+        }
+
+        /* Unsure we can mmap the file... */
+        if (write (buffer->fd, &buffer, 4) != 4)
+        {
+                SERVER_ERROR ("Cannot write in %s : %s",
+                              buffer->filename, strerror (errno));
+                goto error;
+        }
+
+        buffer->ptr = mmap (NULL,
+                            width * height * bpp,
+                            PROT_READ, MAP_SHARED,
+                            buffer->fd, 0);
+        if (buffer->ptr == NULL ||
+            buffer->ptr == MAP_FAILED)
+        {
+                SERVER_ERROR ("Cannot mmap %s : %s",
+                              buffer->filename, strerror (errno));
+                goto error;
+        }
+
+        return buffer;
+
+error:
+        emu_buffer_free (buffer);
+
+        return NULL;
+}
+
+guint
+emu_buffer_get_size (emu_buffer_t *buffer)
+{
+        g_return_val_if_fail (buffer != NULL, 0);
+
+        return buffer->width * buffer->height * buffer->bpp;
+}
+
+gint
+emu_buffer_compare (emu_buffer_t *b1, emu_buffer_t *b2)
+{
+        return b2->id - b1->id;
+}
+
+/**/
+typedef struct
+{
+        GList *buffers;
+        guint  buffer_index;
+        guint  nb_buffers;
+        guint  nb_max_buffers;
+} emu_buffer_pool_t;
+
+void
+emu_buffer_pool_free (emu_buffer_pool_t *pool)
+{
+        g_return_if_fail (pool != NULL);
+
+        g_list_foreach (pool->buffers, (GFunc) emu_buffer_free, NULL);
+        g_list_free (pool->buffers);
+
+        g_free (pool);
+}
+
+emu_buffer_pool_t *
+emu_buffer_pool_new (guint size)
+{
+        emu_buffer_pool_t *pool;
+
+        g_return_val_if_fail (size > 0, NULL);
+
+        pool = g_new0 (emu_buffer_pool_t, 1);
+
+        g_return_val_if_fail (pool != NULL, NULL);
+
+        pool->nb_max_buffers = size;
+
+        return pool;
+}
+
+emu_buffer_t *
+emu_buffer_pool_find_buffer (emu_buffer_pool_t *pool, guint id)
+{
+        emu_buffer_t  buffer;
+        GList        *item;
+
+        g_return_val_if_fail (pool != NULL, NULL);
+
+        buffer.id = id;
+        item = g_list_find_custom (pool->buffers, &buffer,
+                                   (GCompareFunc) emu_buffer_compare);
+
+        if (item)
+        {
+                if (item != pool->buffers)
+                {
+                        /* LRU :) */
+                        pool->buffers = g_list_remove_link (pool->buffers, item);
+                        item->next = pool->buffers;
+                        pool->buffers = item;
+                }
+
+                return (emu_buffer_t *) item->data;
+        }
+
+        return NULL;
+}
+
+emu_buffer_t *
+emu_buffer_pool_add_buffer (emu_buffer_pool_t *pool,
+                            gint width, gint height,
+                            gint bpp)
+{
+        emu_buffer_t *buffer;
+
+        g_return_val_if_fail (pool != NULL, NULL);
+
+        buffer = emu_buffer_new (pool->buffer_index++, width, height, bpp);
+
+        g_return_val_if_fail (buffer != NULL, NULL);
+
+        if (pool->nb_buffers >= pool->nb_max_buffers)
+        {
+                emu_buffer_t *last_buffer;
+                GList *last_item;
+
+                last_item = g_list_last (pool->buffers);
+                last_buffer = (emu_buffer_t *) last_item->data;
+
+                pool->buffers = g_list_delete_link (pool->buffers, last_item);
+                emu_buffer_free (last_buffer);
+        }
+
+        pool->buffers = g_list_insert_before (pool->buffers,
+                                              pool->buffers,
+                                              buffer);
+        pool->nb_buffers++;
+
+        return buffer;
+}
+
+void
+emu_buffer_pool_del_buffer (emu_buffer_pool_t *pool, guint id)
+{
+        emu_buffer_t  dbuffer;
+        GList        *item;
+
+        g_return_if_fail (pool != NULL);
+
+        dbuffer.id = id;
+        item = g_list_find_custom (pool->buffers, &dbuffer,
+                                   (GCompareFunc) emu_buffer_compare);
+
+        if (item)
+        {
+                emu_buffer_t *buffer;
+
+                buffer = (emu_buffer_t *) item->data;
+                pool->buffers = g_list_delete_link (pool->buffers, item);
+                emu_buffer_free (buffer);
+        }
+
+        return;
+}
+
+/**/
+typedef struct
+{
+        gint id;
+
+        emu_buffer_t *buffer;
+
+        gint width, height;
 
         GdkRectangle src;
         GdkRectangle dst;
@@ -67,16 +306,6 @@ typedef struct
         ClutterActor *actor;
 } emu_layer_t;
 
-typedef struct
-{
-        GList        *layers;
-        ClutterStage *stage;
-} emu_mixer_t;
-
-/**/
-gchar *path_to_buffers = DEFAULT_BUFFER_PATH;
-
-/**/
 void
 emu_layer_free (emu_layer_t *layer)
 {
@@ -86,24 +315,6 @@ emu_layer_free (emu_layer_t *layer)
         if (layer->actor)
         {
                 layer->actor = NULL;
-        }
-
-        if (layer->ptr)
-        {
-                munmap (layer->ptr, layer->size);
-                layer->ptr = NULL;
-        }
-
-        if (layer->fd != -1)
-        {
-                close (layer->fd);
-                layer->fd = -1;
-        }
-
-        if (layer->filename)
-        {
-                g_free (layer->filename);
-                layer->filename = NULL;
         }
 
         g_free (layer);
@@ -121,9 +332,9 @@ emu_layer_new (gint id, gint width, gint height)
         layer->id = id;
         layer->width = width;
         layer->height = height;
-        layer->size = 4 * width * height;
+        /* layer->size = 4 * width * height; */
 
-        layer->fd = -1;
+        /* layer->fd = -1; */
 
         /* layer->src.x = sx; */
         /* layer->src.y = sy; */
@@ -182,76 +393,47 @@ emu_layer_set_viewport_output (emu_layer_t *layer,
 }
 
 void
-emu_layer_set_buffer (emu_layer_t *layer, const gchar *filename)
+emu_layer_set_opacity (emu_layer_t *layer, guint8 opacity)
+{
+        g_return_if_fail (layer != NULL);
+
+        clutter_actor_set_opacity (layer->actor, opacity);
+}
+
+void
+emu_layer_set_buffer (emu_layer_t *layer, emu_buffer_t *buffer)
 {
         gboolean  buffer_changed = FALSE;
-        gchar    *tmp_filename;
-        int       fd = -1;
-        void     *ptr = NULL;
 
-        g_return_if_fail ((layer != NULL) || (filename != NULL));
+        g_return_if_fail (layer != NULL || buffer != NULL);
 
-        tmp_filename = g_strdup_printf ("%s/%s",
-                                        path_to_buffers,
-                                        filename);
-        g_return_if_fail (tmp_filename != NULL);
+        UI_DEBUG ("buffer in %s", buffer->filename);
 
-        UI_DEBUG ("buffer in %s", tmp_filename);
-
-        if ((layer->filename == NULL) ||
-            strcmp (tmp_filename, layer->filename))
+        if (layer->buffer != buffer)
         {
-                buffer_changed = TRUE;
-
-                if ((fd = open (tmp_filename, O_RDONLY)) == -1)
-                {
-                        g_error ("Cannot open file %s : %s...",
-                                 tmp_filename, strerror (errno));
-                        g_free (tmp_filename);
-                        return;
-                }
-                UI_DEBUG ("buffer size %lu...", layer->size);
-
-                if ((ptr = mmap (NULL, layer->size,
-                                 PROT_READ, MAP_SHARED, fd, 0)) == MAP_FAILED)
-                {
-                        g_error ("Cannot mmap file %s : %s...",
-                                 tmp_filename, strerror (errno));
-                        close (fd);
-                        g_free (tmp_filename);
-                        return;
-                }
-                UI_DEBUG ("buffer @ %p...", ptr);
+                UI_DEBUG ("changing buffer ptr in clutter");
+                clutter_texture_set_from_rgb_data (CLUTTER_TEXTURE (layer->actor),
+                                                   buffer->ptr,
+                                                   TRUE,
+                                                   layer->width,
+                                                   layer->height,
+                                                   4 * layer->width,
+                                                   4,
+                                                   CLUTTER_TEXTURE_RGB_FLAG_BGR,
+                                                   NULL);
         }
 
-        clutter_texture_set_from_rgb_data (CLUTTER_TEXTURE (layer->actor),
-                                           (ptr != NULL) ? ptr : layer->ptr,
-                                           TRUE,
-                                           layer->width,
-                                           layer->height,
-                                           4 * layer->width,
-                                           4,
-                                           CLUTTER_TEXTURE_RGB_FLAG_BGR,
-                                           NULL);
         clutter_actor_queue_redraw (layer->actor);
-
-        if (buffer_changed)
-        {
-                if (layer->ptr)
-                        munmap (layer->ptr, layer->size);
-                layer->ptr = ptr;
-
-                if (layer->fd != -1)
-                        close (layer->fd);
-                layer->fd = fd;
-
-                if (layer->filename)
-                        g_free (layer->filename);
-                layer->filename = tmp_filename;
-        }
 }
 
 /**/
+typedef struct
+{
+        emu_buffer_pool_t *buffer_pool;
+        GList             *layers;
+        ClutterStage      *stage;
+} emu_mixer_t;
+
 static void
 emu_mixer_free_layer (emu_layer_t *layer,
                       emu_mixer_t *mixer)
@@ -270,8 +452,9 @@ emu_mixer_free (emu_mixer_t *mixer)
         g_list_foreach (mixer->layers,
                         (GFunc) emu_mixer_free_layer,
                         mixer);
-
         g_list_free (mixer->layers);
+
+        emu_buffer_pool_free (mixer->buffer_pool);
 
         g_free (mixer);
 }
@@ -289,7 +472,16 @@ emu_mixer_new (ClutterStage *stage)
 
         mixer->stage = stage;
 
+        mixer->buffer_pool = emu_buffer_pool_new (10);
+        if (mixer->buffer_pool == NULL)
+                goto error;
+
         return mixer;
+
+error:
+        emu_mixer_free (mixer);
+
+        return NULL;
 }
 
 static gint
@@ -367,22 +559,38 @@ emu_mixer_find_layer (emu_mixer_t *mixer, gint id)
         return NULL;
 }
 
-/**/
-#define __LONG_TYPE_64
-
-#include "lazy_passthrough_internal.h"
-
 guint connection_id = 0;
+
+static gboolean
+server_input_send_result (GIOChannel *source, void *result, guint length)
+{
+        gsize transfereddata = 0;
+        int i;
+
+        if ((g_io_channel_write (source,
+                                 (gchar *) result, length,
+                                 &transfereddata) != G_IO_ERROR_NONE) ||
+            (transfereddata != length))
+        {
+                SERVER_ERROR ("Cannot ack operation...");
+                return FALSE;
+        }
+
+        return TRUE;
+}
 
 static gboolean
 server_input_addlayer (GIOChannel *source,
                        emu_mixer_t *mixer)
 {
-        lazy_int_t ret;
         lazy_operation_addlayer_t operation;
-        emu_layer_t *layer;
         gsize transfereddata = 0;
         const gsize toreaddata = sizeof (operation) - sizeof (lazy_operation_t);
+        lazy_operation_addlayer_res_t res_operation;
+        emu_layer_t *layer;
+        emu_buffer_t *buffer;
+
+        res_operation.result = LAZY_OPERATION_RESULT_FAILURE;
 
         if ((g_io_channel_read (source,
                                 ((gchar *) &operation) + sizeof (lazy_operation_t),
@@ -391,27 +599,60 @@ server_input_addlayer (GIOChannel *source,
             (transfereddata != toreaddata))
         {
                 SERVER_ERROR ("Cannot addlayer operation...");
-                return FALSE;
+                return server_input_send_result (source, &res_operation,
+                                         sizeof (res_operation));
         }
 
-        SERVER_DEBUG ("add layer %ix%i@%ix%i -> %ix%i@%ix%i",
+        SERVER_DEBUG ("add layer %ix%i@%ix%i -> %ix%i@%ix%i - buffer=%i",
                       operation.src.w, operation.src.h,
                       operation.src.x, operation.src.y,
                       operation.dst.w, operation.dst.h,
-                      operation.dst.x, operation.dst.y);
+                      operation.dst.x, operation.dst.y,
+                      operation.buffer_id);
 
-        layer = emu_layer_new (operation.layer_num,
+
+        buffer = emu_buffer_pool_find_buffer (mixer->buffer_pool, operation.buffer_id);
+        if (buffer == NULL)
+        {
+                SERVER_ERROR ("Cannot find buffer %i in mixer...",
+                              operation.buffer_id);
+                return server_input_send_result (source, &res_operation,
+                                                 sizeof (res_operation));
+        }
+
+        if (operation.src.x >= buffer->width ||
+            operation.src.y >= buffer->height ||
+            (operation.src.x + operation.src.w) > buffer->width ||
+            (operation.src.y + operation.src.h) > buffer->height)
+        {
+                SERVER_ERROR ("Input viewport is outside of buffer %i...",
+                              operation.buffer_id);
+                return server_input_send_result (source, &res_operation,
+                                                 sizeof (res_operation));
+        }
+
+        layer = emu_layer_new (operation.layer_id,
                                operation.width,
                                operation.height);
+
+        if (layer == NULL)
+        {
+                SERVER_ERROR ("Cannot create new layer%i (%ix%i)",
+                              operation.layer_id,
+                              operation.width, operation.height);
+                return server_input_send_result (source, &res_operation,
+                                                 sizeof (res_operation));
+        }
 
         g_return_val_if_fail (layer != NULL, FALSE);
 
         if (emu_mixer_add_layer (mixer, layer) < 0)
         {
                 emu_layer_free (layer);
-                SERVER_ERROR ("Cannot add layer to mixer...");
-
-                return FALSE;
+                SERVER_ERROR ("Cannot add layer%i to mixer...",
+                              operation.layer_id);
+                return server_input_send_result (source, &res_operation,
+                                                 sizeof (res_operation));
         }
 
         emu_layer_set_viewport_input (layer,
@@ -420,30 +661,24 @@ server_input_addlayer (GIOChannel *source,
         emu_layer_set_viewport_output (layer,
                                        operation.dst.x, operation.dst.y,
                                        operation.dst.w, operation.dst.h);
-        emu_layer_set_buffer (layer, operation.filename);
 
-        /* Roger that... */
-        ret = 1;
-        if ((g_io_channel_write (source,
-                                (gchar *) &ret, sizeof (ret),
-                                 &transfereddata) != G_IO_ERROR_NONE) ||
-            (transfereddata != sizeof (ret)))
-        {
-                SERVER_ERROR ("Cannot ack addlayer operation...");
-                return FALSE;
-        }
+        emu_layer_set_buffer (layer, buffer);
+        res_operation.result = LAZY_OPERATION_RESULT_SUCCESS;
 
-        return TRUE;
+        return server_input_send_result (source, &res_operation,
+                                         sizeof (res_operation));
 }
 
 static gboolean
 server_input_dellayer (GIOChannel *source,
                        emu_mixer_t *mixer)
 {
-        lazy_int_t ret;
         lazy_operation_dellayer_t operation;
         gsize transfereddata = 0;
         const gsize toreaddata = sizeof (operation) - sizeof (lazy_operation_t);
+        lazy_operation_dellayer_res_t res_operation;
+
+        res_operation.result = LAZY_OPERATION_RESULT_FAILURE;
 
         if ((g_io_channel_read (source,
                                 ((gchar *) &operation) + sizeof (lazy_operation_t),
@@ -452,36 +687,31 @@ server_input_dellayer (GIOChannel *source,
             (transfereddata != toreaddata))
         {
                 SERVER_ERROR ("Cannot dellayer operation...");
-                return FALSE;
+                return server_input_send_result (source, &res_operation,
+                                                 sizeof (res_operation));
         }
 
-        SERVER_DEBUG ("del layer %i", operation.layer_num);
+        SERVER_DEBUG ("del layer %i", operation.layer_id);
 
-        emu_mixer_del_layer (mixer, operation.layer_num);
+        emu_mixer_del_layer (mixer, operation.layer_id);
+        res_operation.result = LAZY_OPERATION_RESULT_SUCCESS;
 
-        /* Roger that... */
-        ret = 1;
-        if ((g_io_channel_write (source,
-                                 (gchar *) &ret, sizeof (ret),
-                                 &transfereddata) != G_IO_ERROR_NONE) ||
-            (transfereddata != sizeof (ret)))
-        {
-                SERVER_ERROR ("Cannot ack addlayer operation...");
-                return FALSE;
-        }
-
-        return TRUE;
+        return server_input_send_result (source, &res_operation,
+                                         sizeof (res_operation));
 }
 
 static gboolean
 server_input_fliplayer (GIOChannel *source,
                         emu_mixer_t *mixer)
 {
-        lazy_int_t ret;
         lazy_operation_fliplayer_t operation;
-        emu_layer_t *layer;
         gsize transfereddata = 0;
         const gsize toreaddata = sizeof (operation) - sizeof (lazy_operation_t);
+        lazy_operation_fliplayer_res_t res_operation;
+        emu_layer_t *layer;
+        emu_buffer_t *buffer;
+
+        res_operation.result = LAZY_OPERATION_RESULT_FAILURE;
 
         if ((g_io_channel_read (source,
                                 ((gchar *) &operation) + sizeof (lazy_operation_t),
@@ -490,33 +720,114 @@ server_input_fliplayer (GIOChannel *source,
             (transfereddata != toreaddata))
         {
                 SERVER_ERROR ("Cannot dellayer operation...");
-                return FALSE;
+                return server_input_send_result (source, &res_operation,
+                                                 sizeof (res_operation));
         }
 
-        SERVER_DEBUG ("flip layer %i", operation.layer_num);
+        SERVER_DEBUG ("flip layer %i", operation.layer_id);
 
-        layer = emu_mixer_find_layer (mixer, operation.layer_num);
+        layer = emu_mixer_find_layer (mixer, operation.layer_id);
         if (layer == NULL)
         {
                 SERVER_ERROR ("Cannot find layer %i in mixer...",
-                              operation.layer_num);
-                return FALSE;
+                              operation.layer_id);
+                return server_input_send_result (source, &res_operation,
+                                                 sizeof (res_operation));
         }
 
-        emu_layer_set_buffer (layer, operation.filename);
+        buffer = emu_buffer_pool_find_buffer (mixer->buffer_pool, operation.buffer_id);
+        if (buffer == NULL)
+        {
+                SERVER_ERROR ("Cannot find buffer %i in mixer...",
+                              operation.buffer_id);
+                return server_input_send_result (source, &res_operation,
+                                                 sizeof (res_operation));
+        }
+
+        SERVER_DEBUG ("Flipping to buffer %x", buffer->id);
+        emu_layer_set_buffer (layer, buffer);
+        res_operation.result = LAZY_OPERATION_RESULT_SUCCESS;
+
+        return server_input_send_result (source, &res_operation,
+                                         sizeof (res_operation));
+}
+
+static gboolean
+server_input_addbuffer (GIOChannel *source,
+                        emu_mixer_t *mixer)
+{
+        lazy_operation_addbuffer_t operation;
+        gsize transfereddata = 0;
+        const gsize toreaddata = sizeof (operation) - sizeof (lazy_operation_t);
+        lazy_operation_addbuffer_res_t res_operation;
+        emu_buffer_t *buffer;
+
+        res_operation.result = LAZY_OPERATION_RESULT_FAILURE;
+
+        if ((g_io_channel_read (source,
+                                ((gchar *) &operation) + sizeof (lazy_operation_t),
+                                toreaddata,
+                                &transfereddata) != G_IO_ERROR_NONE) ||
+            (transfereddata != toreaddata))
+        {
+                SERVER_ERROR ("Cannot addbuffer operation...");
+                return server_input_send_result (source, &res_operation,
+                                                 sizeof (res_operation));
+        }
+
+        SERVER_DEBUG ("add buffer %ix%i bpp=%i",
+                      operation.width, operation.height, operation.bpp);
+
+        buffer = emu_buffer_pool_add_buffer (mixer->buffer_pool,
+                                             operation.width, operation.height,
+                                             operation.bpp);
+        if (buffer != NULL)
+        {
+                SERVER_DEBUG ("\tbuffer=%p file=%s", buffer, buffer->filename);
+
+                res_operation.result = LAZY_OPERATION_RESULT_SUCCESS;
+                res_operation.buffer_id = buffer->id;
+        }
+        else
+        {
+                SERVER_ERROR ("Cannot add buffer to pool...");
+        }
 
         /* Roger that... */
-        ret = 1;
-        if ((g_io_channel_write (source,
-                                 (gchar *) &ret, sizeof (ret),
-                                 &transfereddata) != G_IO_ERROR_NONE) ||
-            (transfereddata != sizeof (ret)))
+        return server_input_send_result (source, &res_operation,
+                                         sizeof (res_operation));
+}
+
+static gboolean
+server_input_delbuffer (GIOChannel *source,
+                        emu_mixer_t *mixer)
+{
+        lazy_operation_delbuffer_t operation;
+        gsize transfereddata = 0;
+        const gsize toreaddata = sizeof (operation) - sizeof (lazy_operation_t);
+        lazy_operation_delbuffer_res_t res_operation;
+
+        res_operation.result = LAZY_OPERATION_RESULT_FAILURE;
+
+        if ((g_io_channel_read (source,
+                                ((gchar *) &operation) + sizeof (lazy_operation_t),
+                                toreaddata,
+                                &transfereddata) != G_IO_ERROR_NONE) ||
+            (transfereddata != toreaddata))
         {
-                SERVER_ERROR ("Cannot ack fliplayer operation...");
-                return FALSE;
+                SERVER_ERROR ("Cannot dellayer operation...");
+                return server_input_send_result (source, &res_operation,
+                                                 sizeof (res_operation));
         }
 
-        return TRUE;
+        SERVER_DEBUG ("del buffer %i", operation.buffer_id);
+
+        emu_buffer_pool_del_buffer (mixer->buffer_pool, operation.buffer_id);
+        res_operation.result = LAZY_OPERATION_RESULT_SUCCESS;
+
+        /* Roger that... */
+        return server_input_send_result (source, &res_operation,
+                                         sizeof (res_operation));
 }
 
 static gboolean
@@ -550,16 +861,24 @@ server_input_callback (GIOChannel *source,
 
         switch (op)
         {
-        case LAZY_ADD_LAYER:
+        case LAZY_OPERATION_ADD_LAYER:
                 return server_input_addlayer (source, mixer);
                 break;
 
-        case LAZY_DEL_LAYER:
+        case LAZY_OPERATION_DEL_LAYER:
                 return server_input_dellayer (source, mixer);
                 break;
 
-        case LAZY_FLIP_LAYER:
+        case LAZY_OPERATION_FLIP_LAYER:
                 return server_input_fliplayer (source, mixer);
+                break;
+
+        case LAZY_OPERATION_ADD_BUFFER:
+                return server_input_addbuffer (source, mixer);
+                break;
+
+        case LAZY_OPERATION_DEL_BUFFER:
+                return server_input_delbuffer (source, mixer);
                 break;
 
         default:
