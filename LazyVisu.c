@@ -224,6 +224,8 @@ emu_buffer_pool_find_buffer (emu_buffer_pool_t *pool, guint id)
                 {
                         /* LRU :) */
                         pool->buffers = g_list_remove_link (pool->buffers, item);
+
+                        pool->buffers->prev = item;
                         item->next = pool->buffers;
                         pool->buffers = item;
                 }
@@ -249,8 +251,8 @@ emu_buffer_pool_add_buffer (emu_buffer_pool_t *pool,
 
         if (pool->nb_buffers >= pool->nb_max_buffers)
         {
-                emu_buffer_t *last_buffer;
                 GList *last_item;
+                emu_buffer_t *last_buffer;
 
                 last_item = g_list_last (pool->buffers);
                 last_buffer = (emu_buffer_t *) last_item->data;
@@ -258,11 +260,12 @@ emu_buffer_pool_add_buffer (emu_buffer_pool_t *pool,
                 pool->buffers = g_list_delete_link (pool->buffers, last_item);
                 emu_buffer_free (last_buffer);
         }
+        else
+                pool->nb_buffers++;
 
         pool->buffers = g_list_insert_before (pool->buffers,
                                               pool->buffers,
                                               buffer);
-        pool->nb_buffers++;
 
         return buffer;
 }
@@ -286,9 +289,9 @@ emu_buffer_pool_del_buffer (emu_buffer_pool_t *pool, guint id)
                 buffer = (emu_buffer_t *) item->data;
                 pool->buffers = g_list_delete_link (pool->buffers, item);
                 emu_buffer_free (buffer);
-        }
 
-        return;
+                pool->nb_buffers--;
+        }
 }
 
 /**/
@@ -403,7 +406,7 @@ emu_layer_set_opacity (emu_layer_t *layer, guint8 opacity)
 void
 emu_layer_set_buffer (emu_layer_t *layer, emu_buffer_t *buffer)
 {
-        gboolean  buffer_changed = FALSE;
+        /* gboolean  buffer_changed = FALSE; */
 
         g_return_if_fail (layer != NULL || buffer != NULL);
 
@@ -565,7 +568,7 @@ static gboolean
 server_input_send_result (GIOChannel *source, void *result, guint length)
 {
         gsize transfereddata = 0;
-        int i;
+        /* int i; */
 
         if ((g_io_channel_write (source,
                                  (gchar *) result, length,
